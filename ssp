@@ -62,10 +62,11 @@ our ( $OS_RELEASE, $OS_TYPE, $OS_VERSION, $OS_ISES, $IS_AMAZON, $IS_CLOUDLINUX )
 our $EXTERNAL_IP_ADDRESS;
 our $EXTERNAL_LICENSE_ADDRESS;
 our $TIERS;
+our $TIERS_REF;
 our @LOCAL_IPADDRS_LIST;
 our @PROCESS_LIST;
-our $PROCESS_REF;       # Hash of processes running on system along with details
-our $PORT_REF;          # Hash of ports being listened on along with user/pid/etc
+our $PROCESS_REF;    # Hash of processes running on system along with details
+our $PORT_REF;       # Hash of ports being listened on along with user/pid/etc
 our $IPCS_REF;
 our $HOSTINFO;
 our $CPUINFO;
@@ -101,6 +102,7 @@ our $OPENSSL_RPM_CHANGELOG;
 our $EA4_PHP_FPM;               # Boolean flag indicating if easyapache4's php fpm is running
 our $ORIGINAL_PATH;
 our %SOCKET;                    # Dispatcher for optional Socket module usage
+our $JSON;
 
 # Initialize application by setting loading all global variables
 # (except the RPM variables).  That's done within run()
@@ -140,6 +142,7 @@ sub init {
     $MYSQL_ERROR_LOG = get_mysql_error_log();         # needs $MYSQL_CONF
     $IS_CPANEL       = 1 if -d '/usr/local/cpanel';
     $IS_CPANEL_SOLO  = is_cpanel_solo();
+    $JSON            = _load_json_module();
 
     if ($IS_CPANEL) {
         $CPANEL_VERSION = get_cpanel_version();
@@ -148,6 +151,7 @@ sub init {
         $HTTPD_PATH     = get_httpd_path();            # location of operative httpd
         @PHPINI         = get_phpini();
         $TIERS          = get_tiers_file();
+        $TIERS_REF      = get_tiers_json_href();
         $PUREFTPDCONF   = get_pureftpd_conf();
         $PROFTPDCONF    = get_proftpd_conf();
         $EXIMLOCALOPTS  = get_exim_localopts();
@@ -1127,6 +1131,41 @@ sub get_tiers_file {
     return _http_get( Host => 'httpupdate.cpanel.net', Path => '/cpanelsync/TIERS' );
 }
 
+sub get_tiers_json_href {
+    return unless $JSON;
+    my $raw_json = _http_get( Host => 'httpupdate.cpanel.net', Path => '/cpanelsync/TIERS.json' );
+    return unless $raw_json;
+    my $tiers_data = $JSON->new->utf8->decode($raw_json);
+    if ( defined $tiers_data and exists $tiers_data->{'tiers'} ) {
+        return $tiers_data;
+    }
+}
+
+sub get_tiers_for_version_aref {
+    my ($version) = @_;
+    return unless $TIERS_REF;
+    my ( $parent_ver, $major_ver ) = split( /\./, $version, 3 );
+    my @found_tiers = ();
+    return unless defined $parent_ver and $parent_ver =~ /^\d+$/;
+    return unless defined $major_ver  and $major_ver =~ /^\d+$/;
+    $major_ver++ if $major_ver % 2;    # Bump odd dev versions
+    my $full_ver = join( '.', $parent_ver, $major_ver );
+
+    if ( exists $TIERS_REF->{'tiers'}->{$full_ver} ) {
+        for my $tier_href ( @{ $TIERS_REF->{'tiers'}->{$full_ver} } ) {
+            if ( exists $tier_href->{'is_lts'} and $tier_href->{'is_lts'} ) {
+                push @found_tiers, $full_ver . ' LTS';
+            }
+            if ( exists $tier_href->{'named'} ) {
+                for my $named_tier ( @{ $tier_href->{'named'} } ) {
+                    push @found_tiers, $named_tier;
+                }
+            }
+        }
+    }
+    return \@found_tiers;
+}
+
 sub get_process_list {    # Usage of this needs to be deprecated in favor of the %process hash
     return split /\n/, timed_run( 0, 'ps', 'axwwwf', '-o', 'user,pid,cmd' );
 }
@@ -1742,17 +1781,20 @@ sub print_cpanel_info {
         '64' => { expires => 0,          text => 'September 21, 2017' },
         '66' => { expires => 0,          text => 'December 4, 2017' },
     );
-    my @ver = split( /\./, $CPANEL_VERSION, 4 );
-    my $major_ver = ( defined $ver[1] && $ver[1] =~ /^\d+$/ ) ? $ver[1] : undef;
+    my ( $parent_ver, $major_ver ) = split( /\./, $CPANEL_VERSION, 3 );
     my $expire_info;
-    if ($major_ver) {
+    if ( defined $parent_ver and defined $major_ver ) {
         $major_ver++ if $major_ver % 2;    # Bump odd dev versions
-        $expire_info = "has expired." if $major_ver <= 54;
-        $expire_info = "ended on " . $eol{$major_ver}->{'text'} . "." if exists $eol{$major_ver} && $eol{$major_ver}->{'expires'} <= time();
+        $expire_info = 'has expired.' if $major_ver <= 54;
+        my $found_tiers_aref = get_tiers_for_version_aref( $parent_ver . '.' . $major_ver );
+        if ( defined $found_tiers_aref and scalar @{$found_tiers_aref} == 0 ) {
+            $expire_info = 'has expired (version is not a named or LTS tier in TIERS.json)';
+        }
+        $expire_info = 'ended on ' . $eol{$major_ver}->{'text'} . '.' if exists $eol{$major_ver} && $eol{$major_ver}->{'expires'} <= time();
     }
     if ($expire_info) {
         print_crit('cPanel Info: ');
-        print_critical( "Support for this version of WHM/cPanel " . $expire_info );
+        print_critical( 'Support for this version of WHM/cPanel ' . $expire_info );
         print_critical('         \_ Send customer this premade: "EOL version of cPanel"');
         print_critical('         \_ Some SSP output may be irrelevant, incomplete, or inaccurate for EOL versions!');
     }
@@ -8871,6 +8913,23 @@ sub _http_get {
         }
     }
     return;
+}
+
+sub _choose_json_module {
+    return 'Cpanel::JSON::XS' if $INC{'Cpanel/JSON/XS.pm'};
+    return 'JSON::XS'         if $INC{'JSON/XS.pm'};
+    return 'Cpanel::JSON::XS' if eval { require Cpanel::JSON::XS; 1; };
+    return 'JSON::XS'         if eval { require JSON::XS; 1; };
+    return 'JSON::PP'         if eval { require JSON::PP; 1 };
+}
+
+sub _load_json_module {
+    my $json_class = _choose_json_module();
+    eval {
+        $json_class->import(qw(decode_json));
+        1;
+    };
+    return $json_class;
 }
 
 sub print_bug_report {
